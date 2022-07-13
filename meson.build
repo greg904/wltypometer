@@ -1,5 +1,5 @@
 project(
-	'tmp',
+	'wltypometer',
 	'c',
 	version: '0.1.0',
 	license: 'GPL',
@@ -13,7 +13,7 @@ glesv2 = dependency('glesv2')
 subdir('protocol')
 
 executable(
-	'tmp',
+	'wltypometer',
 	files([
 		'main.c',
 	]),
