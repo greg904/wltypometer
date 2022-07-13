@@ -6,7 +6,6 @@ project(
 )
 
 wayland_client = dependency('wayland-client')
-wayland_protos = dependency('wayland-protocols', version: '>=1.14')
 xkbcommon = dependency('xkbcommon')
 egl = dependency('egl')
 glesv2 = dependency('glesv2')

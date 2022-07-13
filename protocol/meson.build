@@ -1,5 +1,3 @@
-wl_protocol_dir = wayland_protos.get_pkgconfig_variable('pkgdatadir')
-
 wayland_scanner = find_program('wayland-scanner')
 
 # should check wayland_scanner's version, but it is hard to get
@@ -22,9 +20,8 @@ wayland_scanner_client = generator(
 )
 
 client_protocols = [
-	[wl_protocol_dir, 'stable/xdg-shell/xdg-shell.xml'],
-	[wl_protocol_dir, 'unstable/xdg-output/xdg-output-unstable-v1.xml'],
 	['wlr-export-dmabuf-unstable-v1.xml'],
+    ['virtual-keyboard-unstable-v1.xml'],
 ]
 
 client_protos_src = []

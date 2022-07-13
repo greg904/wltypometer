@@ -1,4 +1,7 @@
+#define _GNU_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
 #include <string.h>
 #include <unistd.h>
 #include <wayland-client.h>
@@ -6,13 +9,18 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <time.h>
 
 #include "wlr-export-dmabuf-unstable-v1-client-protocol.h"
+#include "virtual-keyboard-unstable-v1-client-protocol.h"
 
 static void capture_frame();
 
 static struct zwlr_export_dmabuf_manager_v1 *export_manager = NULL;
 static struct wl_output *output = NULL;
+struct wl_seat *seat = NULL;
+struct zwp_virtual_keyboard_manager_v1 *virt_kbd_manager = NULL;
+struct zwp_virtual_keyboard_v1 *virt_kbd = NULL;
 static EGLDisplay egl_display;
 static uint32_t frame_width;
 static uint32_t frame_height;
@@ -22,14 +30,26 @@ static int32_t frame_fds[4];
 static uint32_t frame_offsets[4];
 static uint32_t frame_strides[4];
 static uint64_t frame_modifiers[4];
+static uint32_t input_x;
+static uint32_t input_y;
+static uint32_t input_width;
+static uint32_t input_height;
+static uint32_t *pixels;
+static struct timespec input_time;
+static int input_waiting = 0;
 
 static void registry_global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version)
 {
-	if (strcmp(interface, zwlr_export_dmabuf_manager_v1_interface.name) == 0) {
+	if (!strcmp(interface, zwlr_export_dmabuf_manager_v1_interface.name)) {
 		export_manager = wl_registry_bind(registry, name, &zwlr_export_dmabuf_manager_v1_interface, 1);
-	} else if (strcmp(interface, wl_output_interface.name) == 0) {
+	} else if (!strcmp(interface, zwp_virtual_keyboard_manager_v1_interface.name)) {
+		virt_kbd_manager = wl_registry_bind(registry, name, &zwp_virtual_keyboard_manager_v1_interface, 1);
+	} else if (!strcmp(interface, wl_output_interface.name)) {
 		if (!output)
 			output = wl_registry_bind(registry, name, &wl_output_interface, 4);
+	} else if (!strcmp(interface, wl_seat_interface.name)) {
+		if (!seat)
+			seat = wl_registry_bind(registry, name, &wl_seat_interface, 7);
 	}
 }
 
@@ -47,6 +67,17 @@ static void frame(void *data, struct zwlr_export_dmabuf_frame_v1 *, uint32_t wid
 		frame_modifiers[i] = (((uint64_t) mod_high) << 32) | mod_low;
 }
 
+static int reacted()
+{
+	for (int y = 0; y < input_height; ++y) {
+		for (int x = 0; x < input_width; ++x) {
+			if (pixels[y * input_width + x] != 0xff000000)
+				return 1;
+		}
+	}
+	return 0;
+}
+
 static void ready(void* data, struct zwlr_export_dmabuf_frame_v1* frame, uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec)
 {
 	EGLAttrib attribs[47];
@@ -54,7 +85,7 @@ static void ready(void* data, struct zwlr_export_dmabuf_frame_v1* frame, uint32_
 	EGLImageKHR image;
 	GLuint texture;
 	GLuint fbo;
-	uint32_t pixels[1];
+	struct timespec now;
 
 	attribs[atti++] = EGL_WIDTH;
 	attribs[atti++] = frame_width;
@@ -120,23 +151,57 @@ static void ready(void* data, struct zwlr_export_dmabuf_frame_v1* frame, uint32_
 	image = eglCreateImage(egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
 	if (image == EGL_NO_IMAGE_KHR) {
 		fprintf(stderr, "Failed to create EGL image.\n");
-	} else {
-		glGenTextures(1, &texture);
-		glBindTexture(GL_TEXTURE_2D, texture);
-		PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
-		glEGLImageTargetTexture2DOES(GL_TEXTURE_2D,image);
-
-		glGenFramebuffers(1, &fbo); 
-		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
-		glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-		printf("GL error: %d\n", glGetError());
-		printf("%u\n", pixels[0]);
-
-		glDeleteTextures(1, &texture);
-		eglDestroyImage(egl_display,image); 
+		goto cleanup;
 	}
 
+	glGenTextures(1, &texture);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+	glEGLImageTargetTexture2DOES(GL_TEXTURE_2D,image);
+
+	glGenFramebuffers(1, &fbo); 
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+	glReadPixels(input_x, input_y, input_width, input_height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+	glDeleteTextures(1, &texture);
+	eglDestroyImage(egl_display,image); 
+
+	if (input_waiting) {
+		// We are waiting for the character to appear.
+		if (reacted()) {
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			long diff = now.tv_nsec - input_time.tv_nsec +
+				(now.tv_sec - input_time.tv_sec) * 1000000000;
+			printf("%ld\n", diff);
+
+			input_waiting = 0;
+
+			// Send back space.
+			zwp_virtual_keyboard_v1_key(
+					virt_kbd, 0, 2, WL_KEYBOARD_KEY_STATE_PRESSED
+			);
+			zwp_virtual_keyboard_v1_key(
+					virt_kbd, 0, 2, WL_KEYBOARD_KEY_STATE_RELEASED
+			);
+		}
+	} else {
+		// We are waiting for black before sending a key press.
+		if (!reacted()) {
+			clock_gettime(CLOCK_MONOTONIC, &input_time);
+			input_waiting = 1;
+
+			// Send an 'a'.
+			zwp_virtual_keyboard_v1_key(
+					virt_kbd, 0, 1, WL_KEYBOARD_KEY_STATE_PRESSED
+			);
+			zwp_virtual_keyboard_v1_key(
+					virt_kbd, 0, 1, WL_KEYBOARD_KEY_STATE_RELEASED
+			);
+		}
+	}
+
+cleanup:
 	for (int i = 0; i < frame_planes; ++i)
 		close(frame_fds[i]);
 
@@ -173,7 +238,75 @@ static void capture_frame()
 	zwlr_export_dmabuf_frame_v1_add_listener(frame, &frame_listener, NULL);
 }
 
-int main()
+int parse_pair(const char *str, char sep, uint32_t *a, uint32_t *b) {
+	char *end;
+	long tmp;
+
+	tmp = strtol(str, &end, 10);
+	if (tmp > UINT32_MAX)
+		return 0;
+
+	*a = (uint32_t)tmp;
+
+	if (*end != sep)
+		return 0;
+
+	tmp = strtol(end + 1, &end, 10);
+	if (tmp > UINT32_MAX)
+		return 0;
+
+	*b = (uint32_t)tmp;
+
+	return *end == '\0';
+}
+
+int parse_args(int argc, char **argv) {
+	return argc == 3 &&
+		parse_pair(argv[1], ',', &input_x, &input_y) &&
+		parse_pair(argv[2], 'x', &input_width, &input_height);
+}
+
+static const char *keymap = "xkb_keymap {\n"\
+		"    xkb_keycodes \"(unnamed)\" {\n"\
+		"        minimum = 8;\n"\
+		"        maximum = 11;\n"\
+		"        \n"\
+		"        <K1> = 9;\n"\
+		"        <K2> = 10;\n"\
+		"    };\n"\
+		"\n"\
+	 	"    xkb_types \"(unnamed)\" { include \"complete\" };\n"\
+		"    xkb_compatibility \"(unnamed)\" { include \"complete\" };\n"\
+		"\n"\
+		"    xkb_symbols \"(unnamed)\" {\n"\
+		"        key <K1> {[a]};\n"\
+		"        key <K2> {[BackSpace]};\n"\
+		"    };\n"\
+		"};\n";
+
+static int upload_keymap()
+{
+	int fd;
+
+	fd = memfd_create("keymap", MFD_CLOEXEC);
+	if (fd == -1)
+		return 0;
+
+	// Note: the NUL-byte at the end is required
+	if (write(fd, keymap, strlen(keymap) + 1) == -1) {
+		close(fd);
+		return 0;
+	}
+
+	zwp_virtual_keyboard_v1_keymap(
+		virt_kbd, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd, strlen(keymap) + 1
+	);
+
+	close(fd);
+	return 1;
+}
+
+int main(int argc, char **argv)
 {
 	struct wl_display *display;
 	struct wl_registry *registry;
@@ -183,6 +316,13 @@ int main()
 	EGLint num_config;
 	EGLConfig egl_config;
 	EGLContext egl_context;
+
+	if (!parse_args(argc, argv)) {
+		fprintf(stderr, "Usage: %s <x>,<y> <width>x<height>\n", argv[0]);
+		return 1;
+	}
+
+	pixels = malloc(input_width * input_height * 4);
 
 	display = wl_display_connect(NULL);
 	if (!display) {
@@ -218,15 +358,18 @@ int main()
 		return 1;
 	}
 
-	printf("OpenGL version: %s\n", glGetString(GL_VERSION));
-
 	registry = wl_display_get_registry(display);
 	wl_registry_add_listener(registry, &registry_listener, NULL);
 
 	wl_display_dispatch(display);
 
 	if (!export_manager) {
-		fprintf(stderr, "Missing wlr-export-dmabuf-manager-v1 protocol.\n");
+		fprintf(stderr, "Missing wlr_export_dmabuf_manager_v1 protocol.\n");
+		return 1;
+	}
+
+	if (!virt_kbd_manager) {
+		fprintf(stderr, "Missing virtual_keyboard_unstable_v1 protocol.\n");
 		return 1;
 	}
 
@@ -234,6 +377,27 @@ int main()
 		fprintf(stderr, "No output.\n");
 		return 1;
 	}
+
+	if (!seat) {
+		fprintf(stderr, "No seat.\n");
+		return 1;
+	}
+
+	virt_kbd = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(virt_kbd_manager, seat);	
+
+	if (!upload_keymap()) {
+		fprintf(stderr, "Failed to upload keymap.\n");
+		return 1;
+	}
+	wl_display_roundtrip(display);
+
+	usleep(2000);
+	wl_display_roundtrip(display);
+	usleep(2000);
+	zwp_virtual_keyboard_v1_key(
+			virt_kbd, 0, 1, WL_KEYBOARD_KEY_STATE_RELEASED
+	);
+	wl_display_roundtrip(display);
 
     capture_frame();
 
