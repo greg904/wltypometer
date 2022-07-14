@@ -3,6 +3,8 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,16 +16,35 @@
 #include "virtual-keyboard-unstable-v1-client-protocol.h"
 #include "wlr-export-dmabuf-unstable-v1-client-protocol.h"
 
+static enum state {
+	STATE_NEEDS_ORIGINAL,
+	STATE_ERROR,
+
+	STATE_WAITING_CLEARED,
+	STATE_WAITING_PRESS_KEY,
+	STATE_WAITING_RELEASE_KEY,
+	STATE_WAITING_RELEASE_KEY_REACTED,
+
+	STATE_WAITING_REACTED,
+	STATE_WAITING_PRESS_BACKSPACE,
+	STATE_WAITING_RELEASE_BACKSPACE,
+	STATE_WAITING_RELEASE_BACKSPACE_CLEARED,
+} state;
+
 static struct wl_display *wl_display = NULL;
 static struct zwlr_export_dmabuf_manager_v1 *export_manager = NULL;
 static struct wl_output *output = NULL;
 struct wl_seat *seat = NULL;
 struct zwp_virtual_keyboard_manager_v1 *virt_kbd_manager = NULL;
 struct zwp_virtual_keyboard_v1 *virt_kbd = NULL;
+
 static EGLDisplay egl_display = EGL_NO_DISPLAY;
 static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
 static GLuint gl_fbo;
 static GLuint gl_texture;
+
+static int timer_remaining = -1;
+
 static uint32_t frame_width;
 static uint32_t frame_height;
 static uint32_t frame_format;
@@ -32,16 +53,16 @@ static int32_t frame_fds[4];
 static uint32_t frame_offsets[4];
 static uint32_t frame_strides[4];
 static uint64_t frame_modifiers[4];
+
 static uint32_t watch_x;
 static uint32_t watch_y;
 static uint32_t watch_width;
 static uint32_t watch_height;
+
 static uint32_t *original = NULL;
 static uint32_t *pixels = NULL;
+
 static struct timespec input_time;
-static int has_original = 0;
-static int pressed_key = 0;
-static int error = 0;
 
 static void capture_frame();
 
@@ -79,10 +100,10 @@ static void frame(void *data, struct zwlr_export_dmabuf_frame_v1 *,
 		  uint32_t mod_high, uint32_t mod_low, uint32_t obj_count) {
 	if (obj_count >= 4) {
 		fputs("Too many planes.\n", stderr);
-		error = 1;
+		state = STATE_ERROR;
 	}
 
-	if (error)
+	if (state == STATE_ERROR)
 		return;
 
 	frame_width = width;
@@ -203,91 +224,126 @@ static int read_egl_image_pixels(EGLImageKHR image, uint32_t x, uint32_t y,
 	return 0;
 }
 
-static int check_reacted() {
-	struct timespec now;
-	long diff;
-
-	if (!reacted())
-		return 0;
-
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	diff = now.tv_nsec - input_time.tv_nsec +
-	       (now.tv_sec - input_time.tv_sec) * 1000000000;
-	printf("%ld\n", diff);
-
-	/* Send backspace. */
-	zwp_virtual_keyboard_v1_key(virt_kbd, 0, 2,
-				    WL_KEYBOARD_KEY_STATE_PRESSED);
-	zwp_virtual_keyboard_v1_key(virt_kbd, 0, 2,
-				    WL_KEYBOARD_KEY_STATE_RELEASED);
-
-	if (wl_display_roundtrip(wl_display) == -1) {
-		fputs("Failed to send backspace.\n", stderr);
-		return -1;
-	}
-
-	pressed_key = 0;
-
-	return 0;
+static long timespec_diff_ns(struct timespec lhs, struct timespec rhs) {
+	return lhs.tv_nsec - rhs.tv_nsec +
+	       (lhs.tv_sec - rhs.tv_sec) * 1000000000;
 }
 
-static int check_ready_to_press() {
-	if (reacted())
-		return 0;
+static void start_timer() { timer_remaining = 50 + rand() % 50; }
 
-	/* Send an 'a'. */
-	zwp_virtual_keyboard_v1_key(virt_kbd, 0, 1,
-				    WL_KEYBOARD_KEY_STATE_PRESSED);
-	zwp_virtual_keyboard_v1_key(virt_kbd, 0, 1,
-				    WL_KEYBOARD_KEY_STATE_RELEASED);
-
-	if (wl_display_roundtrip(wl_display) == -1) {
-		fputs("Failed to send key press.\n", stderr);
-		return -1;
+static void fire_timer() {
+	switch (state) {
+	case STATE_WAITING_PRESS_KEY:
+		zwp_virtual_keyboard_v1_key(virt_kbd, 0, 1,
+					    WL_KEYBOARD_KEY_STATE_PRESSED);
+		clock_gettime(CLOCK_MONOTONIC, &input_time);
+		state = STATE_WAITING_RELEASE_KEY;
+		start_timer();
+		break;
+	case STATE_WAITING_RELEASE_KEY:
+		zwp_virtual_keyboard_v1_key(virt_kbd, 0, 1,
+					    WL_KEYBOARD_KEY_STATE_RELEASED);
+		state = STATE_WAITING_REACTED;
+		start_timer();
+		break;
+	case STATE_WAITING_RELEASE_KEY_REACTED:
+		zwp_virtual_keyboard_v1_key(virt_kbd, 0, 1,
+					    WL_KEYBOARD_KEY_STATE_RELEASED);
+		state = STATE_WAITING_PRESS_BACKSPACE;
+		start_timer();
+		break;
+	case STATE_WAITING_PRESS_BACKSPACE:
+		zwp_virtual_keyboard_v1_key(virt_kbd, 0, 2,
+					    WL_KEYBOARD_KEY_STATE_PRESSED);
+		state = STATE_WAITING_RELEASE_BACKSPACE;
+		start_timer();
+		break;
+	case STATE_WAITING_RELEASE_BACKSPACE:
+		zwp_virtual_keyboard_v1_key(virt_kbd, 0, 2,
+					    WL_KEYBOARD_KEY_STATE_RELEASED);
+		state = STATE_WAITING_CLEARED;
+		start_timer();
+		break;
+	case STATE_WAITING_RELEASE_BACKSPACE_CLEARED:
+		zwp_virtual_keyboard_v1_key(virt_kbd, 0, 2,
+					    WL_KEYBOARD_KEY_STATE_RELEASED);
+		state = STATE_WAITING_PRESS_KEY;
+		start_timer();
+		break;
+	default:
+		break;
 	}
-
-	clock_gettime(CLOCK_MONOTONIC, &input_time);
-	pressed_key = 1;
-
-	return 0;
 }
 
 static void ready(void *data, struct zwlr_export_dmabuf_frame_v1 *frame,
 		  uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec) {
 	EGLImageKHR egl_image = EGL_NO_IMAGE_KHR;
-	int ret;
+	struct timespec now;
 
-	if (error)
+	if (state == STATE_ERROR)
 		goto cleanup;
 
 	egl_image = egl_image_from_frame();
 	if (egl_image == EGL_NO_IMAGE_KHR) {
 		fputs("Failed to create EGL image.\n", stderr);
-		error = 1;
+		state = STATE_ERROR;
 		goto cleanup;
 	}
 
 	if (read_egl_image_pixels(egl_image, watch_x, watch_y, watch_width,
 				  watch_height, pixels) == -1) {
 		fputs("Failed read pixels from EGL image.\n", stderr);
-		error = 1;
+		state = STATE_ERROR;
 		goto cleanup;
 	}
 
-	if (has_original) {
-		if (pressed_key) {
-			ret = check_reacted();
-		} else {
-			ret = check_ready_to_press();
+	switch (state) {
+	case STATE_NEEDS_ORIGINAL:
+		memcpy(original, pixels, watch_width * watch_height * 4);
+		state = STATE_WAITING_PRESS_KEY;
+		start_timer();
+		break;
+	case STATE_WAITING_CLEARED:
+		if (!reacted()) {
+			state = STATE_WAITING_PRESS_KEY;
+			start_timer();
 		}
-
-		if (ret == -1) {
-			error = 1;
+		break;
+	case STATE_WAITING_PRESS_KEY:
+	case STATE_WAITING_RELEASE_BACKSPACE_CLEARED:
+		if (reacted()) {
+			fputs("Got a reaction before pressing a key.\n",
+			      stderr);
+			state = STATE_ERROR;
 			goto cleanup;
 		}
-	} else {
-		memcpy(original, pixels, watch_width * watch_height * 4);
-		has_original = 1;
+		break;
+	case STATE_WAITING_RELEASE_KEY:
+	case STATE_WAITING_REACTED:
+		if (!reacted())
+			break;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		printf("%ld\n", timespec_diff_ns(now, input_time));
+
+		state = state == STATE_WAITING_RELEASE_KEY
+				? STATE_WAITING_RELEASE_KEY_REACTED
+				: STATE_WAITING_PRESS_BACKSPACE;
+		break;
+	case STATE_WAITING_PRESS_BACKSPACE:
+	case STATE_WAITING_RELEASE_KEY_REACTED:
+		if (!reacted()) {
+			fputs("Got a clear before pressing backspace.\n",
+			      stderr);
+			state = STATE_ERROR;
+			goto cleanup;
+		}
+	case STATE_WAITING_RELEASE_BACKSPACE:
+		if (!reacted())
+			state = STATE_WAITING_RELEASE_BACKSPACE_CLEARED;
+		break;
+	default:
+		break;
 	}
 
 	capture_frame();
@@ -307,7 +363,7 @@ cleanup:
 static void cancel(void *data, struct zwlr_export_dmabuf_frame_v1 *frame,
 		   enum zwlr_export_dmabuf_frame_v1_cancel_reason reason) {
 	fputs("Received cancel from frame.\n", stderr);
-	error = 1;
+	state = STATE_ERROR;
 }
 
 static void object(void *data, struct zwlr_export_dmabuf_frame_v1 *frame,
@@ -315,10 +371,10 @@ static void object(void *data, struct zwlr_export_dmabuf_frame_v1 *frame,
 		   uint32_t stride, uint32_t plane_index) {
 	if (index >= frame_planes) {
 		fputs("Unexpected object index.\n", stderr);
-		error = 1;
+		state = STATE_ERROR;
 	}
 
-	if (error) {
+	if (state == STATE_ERROR) {
 		close(fd);
 		return;
 	}
@@ -342,7 +398,7 @@ static void capture_frame() {
 	if (zwlr_export_dmabuf_frame_v1_add_listener(frame, &frame_listener,
 						     NULL) == -1) {
 		fputs("Failed to add listener to frame.\n", stderr);
-		error = 1;
+		state = STATE_ERROR;
 	}
 }
 
@@ -436,6 +492,10 @@ int main(int argc, char **argv) {
 	int atti;
 	struct wl_registry *registry;
 	EGLContext egl_context = EGL_NO_CONTEXT;
+	struct timespec poll_start;
+	struct timespec poll_end;
+	struct pollfd poll_fd;
+	int poll_ret;
 
 	if (parse_args(argc, argv) == -1) {
 		fprintf(stderr, "Usage: %s X,Y WIDTHxHEIGHT\n", argv[0]);
@@ -457,6 +517,8 @@ int main(int argc, char **argv) {
 		ret = EXIT_FAILURE;
 		goto end;
 	}
+
+	poll_fd.fd = wl_display_get_fd(wl_display);
 
 	egl_display = eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR,
 					    wl_display, NULL);
@@ -551,10 +613,90 @@ int main(int argc, char **argv) {
 		goto end;
 	}
 
+	srand(time(NULL));
+
 	capture_frame();
 
-	while (!error)
-		wl_display_dispatch(wl_display);
+	clock_gettime(CLOCK_MONOTONIC, &poll_end);
+
+	for (;;) {
+		if (state == STATE_ERROR) {
+			ret = EXIT_FAILURE;
+			goto end;
+		}
+
+		if (timer_remaining == 0) {
+			timer_remaining = -1;
+			fire_timer();
+		}
+
+		while (wl_display_prepare_read(wl_display) == -1) {
+			if (wl_display_dispatch_pending(wl_display) == -1) {
+				fputs("Failed to dispatch Wayland events.\n",
+				      stderr);
+				ret = EXIT_FAILURE;
+				goto end;
+			}
+		}
+
+		poll_fd.events = POLLIN;
+
+		if (wl_display_flush(wl_display) == -1) {
+			if (errno != EAGAIN) {
+				fputs("Failed to flush Wayland messages.\n",
+				      stderr);
+				ret = EXIT_FAILURE;
+				goto end;
+			}
+
+			poll_fd.events |= POLLOUT;
+		}
+
+		poll_start = poll_end;
+
+		poll_ret = poll(&poll_fd, 1, timer_remaining);
+		if (poll_ret == -1) {
+			fputs("Failed to poll Wayland FD.\n", stderr);
+			ret = EXIT_FAILURE;
+			goto end;
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &poll_end);
+
+		if (poll_ret == 0) {
+			timer_remaining = 0;
+		} else if (timer_remaining > 0) {
+			timer_remaining -=
+				timespec_diff_ns(poll_end, poll_start) /
+				1000000;
+			timer_remaining =
+				timer_remaining < 0 ? 0 : timer_remaining;
+		}
+
+		if ((poll_fd.revents & POLLERR) != 0) {
+			fputs("Error on Wayland FD.\n", stderr);
+			ret = EXIT_FAILURE;
+			goto end;
+		}
+
+		if ((poll_fd.revents & POLLIN) != 0) {
+			if (wl_display_read_events(wl_display) == -1) {
+				fputs("Failed to read Wayland events.\n",
+				      stderr);
+				ret = EXIT_FAILURE;
+				goto end;
+			}
+		} else {
+			wl_display_cancel_read(wl_display);
+		}
+
+		if ((poll_fd.revents & POLLOUT) != 0 &&
+		    wl_display_flush(wl_display) == -1) {
+			fputs("Failed to flush Wayland messages.\n", stderr);
+			ret = EXIT_FAILURE;
+			goto end;
+		}
+	}
 
 end:
 	if (egl_context != EGL_NO_CONTEXT)
