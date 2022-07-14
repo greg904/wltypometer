@@ -343,8 +343,7 @@ int main(int argc, char **argv) {
 	EGLContext egl_context;
 
 	if (!parse_args(argc, argv)) {
-		fprintf(stderr, "Usage: %s <x>,<y> <width>x<height>\n",
-			argv[0]);
+		fprintf(stderr, "Usage: %s X,Y WIDTHxHEIGHT\n", argv[0]);
 		return 1;
 	}
 
