@@ -389,15 +389,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Failed to upload keymap.\n");
 		return 1;
 	}
-	wl_display_roundtrip(display);
-
-	usleep(2000);
-	wl_display_roundtrip(display);
-	usleep(2000);
-	zwp_virtual_keyboard_v1_key(
-			virt_kbd, 0, 1, WL_KEYBOARD_KEY_STATE_RELEASED
-	);
-	wl_display_roundtrip(display);
 
     capture_frame();
 
