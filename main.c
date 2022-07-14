@@ -28,13 +28,17 @@ static int32_t frame_fds[4];
 static uint32_t frame_offsets[4];
 static uint32_t frame_strides[4];
 static uint64_t frame_modifiers[4];
-static uint32_t input_x;
-static uint32_t input_y;
-static uint32_t input_width;
-static uint32_t input_height;
+static uint32_t watch_x;
+static uint32_t watch_y;
+static uint32_t watch_width;
+static uint32_t watch_height;
+static uint32_t *original;
 static uint32_t *pixels;
 static struct timespec input_time;
-static int input_waiting = 0;
+static int has_original = 0;
+static int pressed_key = 0;
+
+static void capture_frame();
 
 static void registry_global(void *data, struct wl_registry *registry,
 			    uint32_t name, const char *interface,
@@ -77,20 +81,14 @@ static void frame(void *data, struct zwlr_export_dmabuf_frame_v1 *,
 }
 
 static int reacted() {
-	for (int y = 0; y < input_height; ++y) {
-		for (int x = 0; x < input_width; ++x) {
-			if (pixels[y * input_width + x] != 0xff000000)
+	for (int y = 0; y < watch_height; ++y) {
+		for (int x = 0; x < watch_width; ++x) {
+			if (pixels[y * watch_width + x] !=
+			    original[y * watch_width + x])
 				return 1;
 		}
 	}
 	return 0;
-}
-
-static void capture_frame() {
-	struct zwlr_export_dmabuf_frame_v1 *frame =
-		zwlr_export_dmabuf_manager_v1_capture_output(export_manager, 0,
-							     output);
-	zwlr_export_dmabuf_frame_v1_add_listener(frame, &frame_listener, NULL);
 }
 
 static void ready(void *data, struct zwlr_export_dmabuf_frame_v1 *frame,
@@ -182,41 +180,50 @@ static void ready(void *data, struct zwlr_export_dmabuf_frame_v1 *frame,
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 			       GL_TEXTURE_2D, texture, 0);
-	glReadPixels(input_x, input_y, input_width, input_height, GL_RGBA,
+	glReadPixels(watch_x, watch_y, watch_width, watch_height, GL_RGBA,
 		     GL_UNSIGNED_BYTE, pixels);
 
 	glDeleteTextures(1, &texture);
 	eglDestroyImage(egl_display, image);
 
-	if (input_waiting) {
-		// We are waiting for the character to appear.
-		if (reacted()) {
-			clock_gettime(CLOCK_MONOTONIC, &now);
-			long diff =
-				now.tv_nsec - input_time.tv_nsec +
-				(now.tv_sec - input_time.tv_sec) * 1000000000;
-			printf("%ld\n", diff);
+	if (has_original) {
+		if (pressed_key) {
+			// We are waiting for the character to appear.
+			if (reacted()) {
+				clock_gettime(CLOCK_MONOTONIC, &now);
+				long diff = now.tv_nsec - input_time.tv_nsec +
+					    (now.tv_sec - input_time.tv_sec) *
+						    1000000000;
+				printf("%ld\n", diff);
 
-			input_waiting = 0;
+				pressed_key = 0;
 
-			// Send back space.
-			zwp_virtual_keyboard_v1_key(
-				virt_kbd, 0, 2, WL_KEYBOARD_KEY_STATE_PRESSED);
-			zwp_virtual_keyboard_v1_key(
-				virt_kbd, 0, 2, WL_KEYBOARD_KEY_STATE_RELEASED);
+				// Send back space.
+				zwp_virtual_keyboard_v1_key(
+					virt_kbd, 0, 2,
+					WL_KEYBOARD_KEY_STATE_PRESSED);
+				zwp_virtual_keyboard_v1_key(
+					virt_kbd, 0, 2,
+					WL_KEYBOARD_KEY_STATE_RELEASED);
+			}
+		} else {
+			// We are waiting for black before sending a key press.
+			if (!reacted()) {
+				clock_gettime(CLOCK_MONOTONIC, &input_time);
+				pressed_key = 1;
+
+				// Send an 'a'.
+				zwp_virtual_keyboard_v1_key(
+					virt_kbd, 0, 1,
+					WL_KEYBOARD_KEY_STATE_PRESSED);
+				zwp_virtual_keyboard_v1_key(
+					virt_kbd, 0, 1,
+					WL_KEYBOARD_KEY_STATE_RELEASED);
+			}
 		}
 	} else {
-		// We are waiting for black before sending a key press.
-		if (!reacted()) {
-			clock_gettime(CLOCK_MONOTONIC, &input_time);
-			input_waiting = 1;
-
-			// Send an 'a'.
-			zwp_virtual_keyboard_v1_key(
-				virt_kbd, 0, 1, WL_KEYBOARD_KEY_STATE_PRESSED);
-			zwp_virtual_keyboard_v1_key(
-				virt_kbd, 0, 1, WL_KEYBOARD_KEY_STATE_RELEASED);
-		}
+		memcpy(original, pixels, watch_width * watch_height * 4);
+		has_original = 1;
 	}
 
 cleanup:
@@ -251,6 +258,13 @@ static const struct zwlr_export_dmabuf_frame_v1_listener frame_listener = {
 	.cancel = cancel,
 };
 
+static void capture_frame() {
+	struct zwlr_export_dmabuf_frame_v1 *frame =
+		zwlr_export_dmabuf_manager_v1_capture_output(export_manager, 0,
+							     output);
+	zwlr_export_dmabuf_frame_v1_add_listener(frame, &frame_listener, NULL);
+}
+
 int parse_pair(const char *str, char sep, uint32_t *a, uint32_t *b) {
 	char *end;
 	long tmp;
@@ -274,8 +288,8 @@ int parse_pair(const char *str, char sep, uint32_t *a, uint32_t *b) {
 }
 
 int parse_args(int argc, char **argv) {
-	return argc == 3 && parse_pair(argv[1], ',', &input_x, &input_y) &&
-	       parse_pair(argv[2], 'x', &input_width, &input_height);
+	return argc == 3 && parse_pair(argv[1], ',', &watch_x, &watch_y) &&
+	       parse_pair(argv[2], 'x', &watch_width, &watch_height);
 }
 
 static const char *keymap =
@@ -334,7 +348,8 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
-	pixels = malloc(input_width * input_height * 4);
+	pixels = malloc(watch_width * watch_height * 4);
+	original = malloc(watch_width * watch_height * 4);
 
 	display = wl_display_connect(NULL);
 	if (!display) {
